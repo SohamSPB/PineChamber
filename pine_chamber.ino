@@ -4,15 +4,43 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
+
+// A0: SOIL_MOISTURE_ANALOG_PIN (HW-080 analog reading)
+// D0: SOIL_MOISTURE_PIN (HW-080 digital reading)
+// D1: SCL (OLED)
+// D2: SDA (OLED)
+// D3: ONE_WIRE_BUS (DS18B20s)
+// D4: DHTPIN_INSIDE (DHT22)
+// D5: DHTPIN_OUTSIDE (DHT22)
+// D6: LATCH_PIN (74HC595)
+// D7: CLOCK_PIN (74HC595)
+// D8: DATA_PIN (74HC595)
+// 74HC595 Outputs:
+//   Bit 0: Red LED
+//   Bit 1: Green LED
+//   Bit 2: Blue LED
+//   Bit 3: Relay
+//   Bit 4: Buzzer
+
 // ---------- Pin Config ----------
 #define ONE_WIRE_BUS D3
-#define RELAY_PIN D5
-#define DHTPIN_INSIDE D6
-#define DHTPIN_OUTSIDE D7
+#define DHTPIN_INSIDE D4
+#define DHTPIN_OUTSIDE D5
 #define DHTTYPE DHT22
-#define BUZZER_PIN D8
 #define SOIL_MOISTURE_ANALOG_PIN A0 // Analog pin for soil moisture sensor
-#define SOIL_MOISTURE_PIN D4 // Digital pin for soil moisture sensor
+#define SOIL_MOISTURE_PIN D0 // Digital pin for soil moisture sensor
+
+// 74HC595 Shift Register Pins
+#define LATCH_PIN D6
+#define CLOCK_PIN D7
+#define DATA_PIN D8
+
+// 74HC595 Output Bit Assignments
+#define LED_RED_BIT 0
+#define LED_GREEN_BIT 1
+#define LED_BLUE_BIT 2
+#define RELAY_BIT 3
+#define BUZZER_BIT 4
 
 // ---------- Sensors ----------
 DHT dhtInside(DHTPIN_INSIDE, DHTTYPE);
@@ -41,6 +69,7 @@ bool coolingOffStage1 = false;
 unsigned long coolingOffStart = 0;
 float soilMoistureAnalog = 0; // Variable to store analog soil moisture reading
 bool soilMoisture = HIGH; // Variable to store digital soil moisture reading (HIGH for dry, LOW for wet, typically)
+byte shiftRegisterState = 0; // Global variable to hold the current state of the shift register outputs
 
 // ---------- Scrolling title ----------
 String titleText = "Pine Chamber   ";
@@ -78,12 +107,21 @@ void centerText(String strr, int lineNo, bool buf = false) {
   free(charArray);
 }
 
+// ---------- 74HC595 Helper ----------
+void updateShiftRegister(byte value) {
+  digitalWrite(LATCH_PIN, LOW);
+  shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, value);
+  digitalWrite(LATCH_PIN, HIGH);
+}
+
 // ---------- Buzzer patterns ----------
 void beepPattern(int count, int onTime = 120, int offTime = 120) {
   for (int i = 0; i < count; i++) {
-    digitalWrite(BUZZER_PIN, HIGH);
+    shiftRegisterState |= (1 << BUZZER_BIT); // Turn buzzer ON
+    updateShiftRegister(shiftRegisterState);
     delay(onTime);
-    digitalWrite(BUZZER_PIN, LOW);
+    shiftRegisterState &= ~(1 << BUZZER_BIT); // Turn buzzer OFF
+    updateShiftRegister(shiftRegisterState);
     delay(offTime);
   }
 }
@@ -115,13 +153,33 @@ void checkAlarms(float chamberTemp, float waterTemp, bool soilMoisture) {
   }
 }
 
+void updateLEDStatus(float chamberTemp, float waterTemp, bool soilMoisture) {
+  // Clear previous LED bits in shiftRegisterState
+  shiftRegisterState &= ~((1 << LED_RED_BIT) | (1 << LED_GREEN_BIT) | (1 << LED_BLUE_BIT));
+
+  // Red (Critical Alarm)
+  if (soilMoisture == HIGH || chamberTemp > 29) {
+    shiftRegisterState |= (1 << LED_RED_BIT); // Red
+  } 
+  // Yellow (Warning)
+  else if (waterTemp > 28 || chamberTemp > 27 || chamberTemp > 25.5 || chamberTemp > 24) {
+    shiftRegisterState |= (1 << LED_RED_BIT) | (1 << LED_GREEN_BIT); // Yellow (Red + Green)
+  }
+  // Green (Normal)
+  else {
+    shiftRegisterState |= (1 << LED_GREEN_BIT); // Green
+  }
+  updateShiftRegister(shiftRegisterState);
+}
+
 // ---------- Cooling shutdown sequence ----------
 void handleCoolingShutdown(float chamberTemp) {
   if (!coolingShutdownEnabled) return;
 
   if (chamberTemp > 28 && !coolingOffStage1) {
     Serial.println("ALERT: Chamber too hot. Starting staged shutdown...");
-    digitalWrite(RELAY_PIN, LOW);  // turn off peltiers
+    shiftRegisterState &= ~(1 << RELAY_BIT);  // turn off peltiers (LOW for relay ON, HIGH for OFF)
+    updateShiftRegister(shiftRegisterState);
     coolingOffStart = millis();
     coolingOffStage1 = true;
   }
@@ -139,13 +197,16 @@ void setup() {
   dhtOutside.begin();
   ds.begin();
 
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
-
-  pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, HIGH);
-
   pinMode(SOIL_MOISTURE_PIN, INPUT_PULLUP); // Digital soil moisture pin as input with pullup
+
+  // Initialize 74HC595 pins
+  pinMode(LATCH_PIN, OUTPUT);
+  pinMode(CLOCK_PIN, OUTPUT);
+  pinMode(DATA_PIN, OUTPUT);
+
+  // Initialize shift register outputs (all off, relay HIGH for off)
+  shiftRegisterState = (1 << RELAY_BIT); // Set relay bit HIGH (off) initially
+  updateShiftRegister(shiftRegisterState);
 
   Wire.begin(); // SDA=D2, SCL=D1
   u8g2.begin();
@@ -184,6 +245,7 @@ void loop() {
 
     // Logic
     checkAlarms(chamberTemp, waterTemp, soilMoisture);
+    updateLEDStatus(chamberTemp, waterTemp, soilMoisture);
     handleCoolingShutdown(chamberTemp);
   }
 
