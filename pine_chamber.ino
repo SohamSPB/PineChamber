@@ -11,6 +11,8 @@
 #define DHTPIN_OUTSIDE D7
 #define DHTTYPE DHT22
 #define BUZZER_PIN D8
+#define SOIL_MOISTURE_ANALOG_PIN A0 // Analog pin for soil moisture sensor
+#define SOIL_MOISTURE_PIN D4 // Digital pin for soil moisture sensor
 
 // ---------- Sensors ----------
 DHT dhtInside(DHTPIN_INSIDE, DHTTYPE);
@@ -37,6 +39,8 @@ int dotCount = 0;
 bool coolingShutdownEnabled = false;
 bool coolingOffStage1 = false;
 unsigned long coolingOffStart = 0;
+float soilMoistureAnalog = 0; // Variable to store analog soil moisture reading
+bool soilMoisture = HIGH; // Variable to store digital soil moisture reading (HIGH for dry, LOW for wet, typically)
 
 // ---------- Scrolling title ----------
 String titleText = "Pine Chamber   ";
@@ -84,12 +88,19 @@ void beepPattern(int count, int onTime = 120, int offTime = 120) {
   }
 }
 
-void checkAlarms(float chamberTemp) {
+void checkAlarms(float chamberTemp, float waterTemp, bool soilMoisture) {
   static unsigned long lastBeepTime = 0;
   unsigned long now = millis();
-  if (now - lastBeepTime < 10000 || isnan(chamberTemp)) return;
+  if (now - lastBeepTime < 10000 || isnan(chamberTemp) || isnan(waterTemp)) return;
 
-  if (chamberTemp > 29) {
+  // Digital soil moisture alarm (HIGH typically means dry)
+  if (soilMoisture == HIGH) {
+    beepPattern(7, 60, 60); // Distinct pattern for critically low soil moisture (digital)
+    lastBeepTime = now;
+  } else if (waterTemp > 28) {
+    beepPattern(5, 50, 50); // Distinct pattern for high water temp
+    lastBeepTime = now;
+  } else if (chamberTemp > 29) {
     beepPattern(4, 80, 80);
     lastBeepTime = now;
   } else if (chamberTemp > 27) {
@@ -134,6 +145,8 @@ void setup() {
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, HIGH);
 
+  pinMode(SOIL_MOISTURE_PIN, INPUT_PULLUP); // Digital soil moisture pin as input with pullup
+
   Wire.begin(); // SDA=D2, SCL=D1
   u8g2.begin();
   u8g2.enableUTF8Print();
@@ -161,12 +174,16 @@ void loop() {
     chamberTemp = ds.getTempC(chamberSensor);
     waterTemp = ds.getTempC(waterSensor);
 
+    // Soil Moisture
+    soilMoistureAnalog = analogRead(SOIL_MOISTURE_ANALOG_PIN);
+    soilMoisture = digitalRead(SOIL_MOISTURE_PIN);
+
     // Serial debug
-    Serial.printf("In: %.1fC %.1f%% | Out: %.1fC %.1f%% | Chamber: %.1fC | Water: %.1fC\n",
-                  tIn, hIn, tOut, hOut, chamberTemp, waterTemp);
+    Serial.printf("In: %.1fC %.1f%% | Out: %.1fC %.1f%% | Chamber: %.1fC | Water: %.1fC | Soil Analog: %.0f | Soil Digital: %s\n",
+                  tIn, hIn, tOut, hOut, chamberTemp, waterTemp, soilMoistureAnalog, soilMoisture == HIGH ? "DRY" : "WET");
 
     // Logic
-    checkAlarms(chamberTemp);
+    checkAlarms(chamberTemp, waterTemp, soilMoisture);
     handleCoolingShutdown(chamberTemp);
   }
 
@@ -199,6 +216,14 @@ void loop() {
   // Water
   printText("Water:", 5);
   rightText(waterTemp>-100? String(waterTemp,1)+"C":"Err", 5);
+
+  // Soil Moisture Analog
+  printText("Soil A:", 6);
+  rightText(String((int)soilMoistureAnalog), 6);
+
+  // Soil Moisture Digital
+  printText("Soil D:", 7);
+  rightText(soilMoisture == HIGH ? "DRY" : "WET", 7);
 
   u8g2.sendBuffer();
 }
