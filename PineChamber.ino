@@ -20,7 +20,7 @@
 //   Bit 0: Red LED
 //   Bit 1: Green LED
 //   Bit 2: Blue LED
-//   Bit 3: Relay
+//   Bit 3: Peltier (via relay)
 //   Bit 4: Buzzer
 
 // ---------- Pin Config ----------
@@ -40,7 +40,7 @@
 #define LED_RED_BIT 0
 #define LED_GREEN_BIT 1
 #define LED_BLUE_BIT 2
-#define RELAY_BIT 3
+#define PELTIER_BIT 3
 #define BUZZER_BIT 4
 
 // ---------- Sensors ----------
@@ -88,7 +88,7 @@ unsigned long lastWaterSensorAlarm = 0;
 void sr_setBit(uint8_t bit, bool level);
 void sr_applyBits(uint8_t mask, uint8_t values);
 bool sr_getBit(uint8_t bit);
-void setRelay(bool on);
+void setPeltier(bool on);
 void setBuzzer(bool on);
 void setLedColorRed();
 void setLedColorYellow();
@@ -96,6 +96,7 @@ void setLedColorGreen();
 
 void logEvent(const char *level, const char *message);
 void setSafeActuators();
+void centerText(String strr, int lineNo, bool buf);
 
 void displayAlarm(String message) {
   alarmActive = true;
@@ -163,11 +164,11 @@ bool sr_getBit(uint8_t bit) {
   return (shiftRegisterState & (1 << bit)) != 0;
 }
 
-void setRelay(bool on) {
+void setPeltier(bool on) {
   // Determine which physical level corresponds to logical 'on'
-  bool onLevel = (RELAY_ON == HIGH);
-  bool level = on ? onLevel : (RELAY_OFF == HIGH);
-  sr_setBit(RELAY_BIT, level);
+  bool onLevel = (PELTIER_ON == HIGH);
+  bool level = on ? onLevel : (PELTIER_OFF == HIGH);
+  sr_setBit(PELTIER_BIT, level);
 }
 
 void setBuzzer(bool on) {
@@ -219,7 +220,7 @@ void setSafeActuators() {
     logEvent("INFO", "Operator override enabled - skipping safe actuator enforcement.");
     return;
   }
-  setRelay(true);
+  setPeltier(true);
   setBuzzer(false);
   setLedColorRed(); // visible critical state
   logEvent("INFO", "Actuators moved to safe state.");
@@ -364,7 +365,7 @@ void handleCoolingShutdown(float chamberTemp) {
   if (chamberTemp > TEMP_HIGH && !coolingOffStage1) {
     Serial.println("ALERT: Chamber too hot. Starting staged shutdown...");
     // Turn off peltiers
-    setRelay(false);
+    setPeltier(false);
     coolingOffStart = millis();
     coolingOffStage1 = true;
     logEvent("INFO", "Cooling staged shutdown started");
@@ -392,7 +393,7 @@ void setup() {
   pinMode(DATA_PIN, OUTPUT);
 
   // Initialize to safe defaults BEFORE any blocking operations
-  setRelay(true);
+  setPeltier(true);
   setBuzzer(false);
   setLedColorYellow();
 

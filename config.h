@@ -25,8 +25,8 @@ const unsigned long SENSOR_NAN_ALARM_REPEAT_MS = 60000UL; // min repeat time for
 
 // Actuator polarity defaults (set to match hardware wiring)
 // Typical relay boards are LOW = ON, HIGH = OFF. Adjust if your board is different.
-const uint8_t RELAY_ON  = LOW;
-const uint8_t RELAY_OFF = HIGH;
+const uint8_t PELTIER_ON  = LOW;
+const uint8_t PELTIER_OFF = HIGH;
 const uint8_t BUZZER_ON = HIGH;
 const uint8_t BUZZER_OFF = LOW;
 
