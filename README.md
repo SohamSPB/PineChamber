@@ -25,12 +25,10 @@ The system utilizes an ESP8266-based microcontroller and the following connected
 
 ## Current Functionality
 1.  **Sensor Data Acquisition:** Reads temperature and humidity data from DHT22 sensors, precise temperatures from DS18B20 sensors, and both analog (`soilMoistureAnalog`) and digital (`soilMoisture`) soil moisture levels from the HW-080 sensor every 2 seconds.
-2.  **OLED Display:** Shows current internal/external temperature and humidity, chamber and water temperatures, and both analog (`soilMoistureAnalog`) and digital (`soilMoisture`) soil moisture levels on a scrolling display.
-3.  **Temperature Alarms:** Triggers a buzzer (controlled via 74HC595) with varying patterns based on chamber temperature thresholds (e.g., single beep for >24°C, multiple beeps for higher temperatures).
-4.  **Water Temperature Alarms:** Triggers a distinct buzzer pattern (controlled via 74HC595) if the water temperature exceeds 28°C, indicating potential cooling inefficiency.
-5.  **Soil Moisture Alarms:** Triggers a distinct buzzer pattern (controlled via 74HC595) if the digital output (`soilMoisture`) of the soil moisture sensor indicates dry conditions, prompting the operator to water the plant. The analog reading (`soilMoistureAnalog`) is used for display purposes only.
-6.  **Cooling Shutdown Sequence:** Implements a safety shutdown for the cooling system. If the chamber temperature exceeds 28°C, the Peltier cooler is turned off via the relay (controlled via 74HC595). A placeholder is in place for a second stage that would turn off fans and the water pump after a delay.
-7.  **Multi-color LED Status Indicator:** A multi-color LED (controlled via a 74HC595 shift register) provides a quick visual status:
+2.  **OLED Display:** Shows current internal/external temperature and humidity, chamber and water temperatures, and both analog (`soilMoistureAnalog`) and digital (`soilMoisture`) soil moisture levels on a scrolling display. Shows alarm message when an alarm is active.
+3.  **Alarms:** Triggers a buzzer (controlled via 74HC595) with varying patterns (e.g., single beep for >24°C, multiple beeps for higher temperatures, dry soil, etc).
+4.  **Cooling Shutdown Sequence:** Implements a safety shutdown for the cooling system. If the chamber temperature exceeds 28°C, the Peltier cooler is turned off via the relay (controlled via 74HC595). A placeholder is in place for a second stage that would turn off fans and the water pump after a delay.
+5.  **Multi-color LED Status Indicator:** A multi-color LED (controlled via a 74HC595 shift register) for quick visual status:
     *   **Red:** Critical alarms (e.g., dry soil, very high chamber temperature).
     *   **Yellow:** Warnings (e.g., high water temperature, moderately high chamber temperature).
     *   **Green:** Normal operation.
@@ -38,10 +36,10 @@ The system utilizes an ESP8266-based microcontroller and the following connected
 **Configuration:** Temperature thresholds for alarms and cooling control are currently hardcoded within the firmware. Any changes to these thresholds require modifying the source code and reflashing the microcontroller.
 
 ## Future Plans
-*   **Visual Alarms on OLED:** Implement visual indicators or messages on the OLED display when an alarm condition is met, complementing the audible buzzer.
 *   **OLED Auto-Off with Button Activation:** Implement a feature where the OLED display automatically turns off after 2 minutes of inactivity to prevent burn-in. The display should turn on for 2 minutes when a button is pressed or when a buzzer alarm is triggered.
 *   **Remove Analog Soil Moisture Pin:** Due to limited analog pins and the prioritization of the digital output for alarms, the analog soil moisture reading will eventually be removed entirely, with the pin becoming available for other uses.
 *   **Automated Water Pump and Fan Control:** Integrate the water pump and fans into the automated control system. This will involve connecting them to additional relays and programming their control logic, especially within the cooling shutdown sequence.
+* **Automated two-bucket swap system:** Since heated water bucket cools down when not used for some time, we can have 2 water reservoirs being used alternatively based on water temperature. Alarm and human intervention will only be needed if both reservoirs have high temperatures.
 
 ## Parts Yet to Purchase/Integrate
 *   **Internal DHT Sensor:** The `DHTPIN_INSIDE` sensor is currently non-functional and needs to be purchased/replaced.

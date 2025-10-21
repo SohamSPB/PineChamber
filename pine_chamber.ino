@@ -70,6 +70,17 @@ unsigned long coolingOffStart = 0;
 float soilMoistureAnalog = 0; // Variable to store analog soil moisture reading
 bool soilMoisture = HIGH; // Variable to store digital soil moisture reading (HIGH for dry, LOW for wet, typically)
 byte shiftRegisterState = 0; // Global variable to hold the current state of the shift register outputs
+bool alarmActive = false; // Global variable to track if an alarm is active
+unsigned long alarmStartTime = 0; // Global variable to track when an alarm is activated
+
+void displayAlarm(String message) {
+  alarmActive = true;
+  alarmStartTime = millis();
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB10_tr); // Larger font for alarm
+  centerText(message, 3, true);
+}
+
 
 // ---------- Scrolling title ----------
 String titleText = "Pine Chamber   ";
@@ -133,21 +144,27 @@ void checkAlarms(float chamberTemp, float waterTemp, bool soilMoisture) {
 
   // Digital soil moisture alarm (HIGH typically means dry)
   if (soilMoisture == HIGH) {
+    displayAlarm("SOIL DRY!");
     beepPattern(7, 60, 60); // Distinct pattern for critically low soil moisture (digital)
     lastBeepTime = now;
   } else if (waterTemp > 28) {
+    displayAlarm("WATER TEMP HIGH!");
     beepPattern(5, 50, 50); // Distinct pattern for high water temp
     lastBeepTime = now;
   } else if (chamberTemp > 29) {
+    displayAlarm("CHAMBER TEMP HIGH!");
     beepPattern(4, 80, 80);
     lastBeepTime = now;
   } else if (chamberTemp > 27) {
+    displayAlarm("CHAMBER TEMP WARM");
     beepPattern(3);
     lastBeepTime = now;
   } else if (chamberTemp > 25.5) {
+    displayAlarm("CHAMBER TEMP WARM");
     beepPattern(2);
     lastBeepTime = now;
   } else if (chamberTemp > 24) {
+    displayAlarm("CHAMBER TEMP WARM");
     beepPattern(1);
     lastBeepTime = now;
   }
@@ -250,6 +267,11 @@ void loop() {
   }
 
   // ----- Display -----
+  if (alarmActive) {
+    if (millis() - alarmStartTime >= 5000) {
+      alarmActive = false;
+    }
+  }
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_ncenB08_tr);
 
