@@ -1,3 +1,4 @@
+#include "config.h"
 #include <Wire.h>
 #include <U8g2lib.h>
 #include <DHT.h>
@@ -60,7 +61,6 @@ U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/U8X8_PIN_NONE);
 
 // ---------- Timing ----------
 unsigned long lastRead = 0;
-const unsigned long readInterval = 2000;
 
 // ---------- State ----------
 int dotCount = 0;
@@ -69,9 +69,33 @@ bool coolingOffStage1 = false;
 unsigned long coolingOffStart = 0;
 float soilMoistureAnalog = 0; // Variable to store analog soil moisture reading
 bool soilMoisture = HIGH; // Variable to store digital soil moisture reading (HIGH for dry, LOW for wet, typically)
-byte shiftRegisterState = 0; // Global variable to hold the current state of the shift register outputs
+static byte shiftRegisterState = 0; // single source of truth for shift register output bits
 bool alarmActive = false; // Global variable to track if an alarm is active
 unsigned long alarmStartTime = 0; // Global variable to track when an alarm is activated
+
+// Operator override for bench testing. Default false.
+bool OPERATOR_OVERRIDE = false;
+
+// Sensor fault tracking
+uint8_t chamberSensorFailCount = 0;
+uint8_t waterSensorFailCount = 0;
+bool chamberPersistentAlarm = false;
+bool waterPersistentAlarm = false;
+unsigned long lastChamberSensorAlarm = 0;
+unsigned long lastWaterSensorAlarm = 0;
+
+// Forward declarations for get/set APIs
+void sr_setBit(uint8_t bit, bool level);
+void sr_applyBits(uint8_t mask, uint8_t values);
+bool sr_getBit(uint8_t bit);
+void setRelay(bool on);
+void setBuzzer(bool on);
+void setLedColorRed();
+void setLedColorYellow();
+void setLedColorGreen();
+
+void logEvent(const char *level, const char *message);
+void setSafeActuators();
 
 void displayAlarm(String message) {
   alarmActive = true;
@@ -86,7 +110,6 @@ void displayAlarm(String message) {
 String titleText = "Pine Chamber   ";
 int titleX = 0;
 unsigned long lastScroll = 0;
-const unsigned long scrollInterval = 40; // adjust for speed
 
 // ---------- Helpers ----------
 char *getChars(String input) {
@@ -125,84 +148,231 @@ void updateShiftRegister(byte value) {
   digitalWrite(LATCH_PIN, HIGH);
 }
 
+void sr_setBit(uint8_t bit, bool level) {
+  if (level) shiftRegisterState |= (1 << bit);
+  else shiftRegisterState &= ~(1 << bit);
+  updateShiftRegister(shiftRegisterState);
+}
+
+void sr_applyBits(uint8_t mask, uint8_t values) {
+  shiftRegisterState = (shiftRegisterState & ~mask) | (values & mask);
+  updateShiftRegister(shiftRegisterState);
+}
+
+bool sr_getBit(uint8_t bit) {
+  return (shiftRegisterState & (1 << bit)) != 0;
+}
+
+void setRelay(bool on) {
+  // Determine which physical level corresponds to logical 'on'
+  bool onLevel = (RELAY_ON == HIGH);
+  bool level = on ? onLevel : (RELAY_OFF == HIGH);
+  sr_setBit(RELAY_BIT, level);
+}
+
+void setBuzzer(bool on) {
+  bool onLevel = (BUZZER_ON == HIGH);
+  bool level = on ? onLevel : (BUZZER_OFF == HIGH);
+  sr_setBit(BUZZER_BIT, level);
+}
+
+void setLedColorRed() {
+  uint8_t mask = (1 << LED_RED_BIT) | (1 << LED_GREEN_BIT) | (1 << LED_BLUE_BIT);
+  uint8_t vals = (1 << LED_RED_BIT);
+  sr_applyBits(mask, vals);
+}
+
+void setLedColorYellow() {
+  uint8_t mask = (1 << LED_RED_BIT) | (1 << LED_GREEN_BIT) | (1 << LED_BLUE_BIT);
+  uint8_t vals = (1 << LED_RED_BIT) | (1 << LED_GREEN_BIT);
+  sr_applyBits(mask, vals);
+}
+
+void setLedColorGreen() {
+  uint8_t mask = (1 << LED_RED_BIT) | (1 << LED_GREEN_BIT) | (1 << LED_BLUE_BIT);
+  uint8_t vals = (1 << LED_GREEN_BIT);
+  sr_applyBits(mask, vals);
+}
+
 // ---------- Buzzer patterns ----------
 void beepPattern(int count, int onTime = 120, int offTime = 120) {
   for (int i = 0; i < count; i++) {
-    shiftRegisterState |= (1 << BUZZER_BIT); // Turn buzzer ON
-    updateShiftRegister(shiftRegisterState);
+    setBuzzer(true);
     delay(onTime);
-    shiftRegisterState &= ~(1 << BUZZER_BIT); // Turn buzzer OFF
-    updateShiftRegister(shiftRegisterState);
+    setBuzzer(false);
     delay(offTime);
   }
+}
+
+// ---------- Logging ----------
+void logEvent(const char *level, const char *message) {
+  // Minimal logging: uptime timestamp in ms
+  char buf[128];
+  unsigned long t = millis();
+  snprintf(buf, sizeof(buf), "[%lu] %s: %s", t, level, message);
+  Serial.println(buf);
+}
+
+void setSafeActuators() {
+  // Move actuators to safe state. Respect operator override during bench testing.
+  if (OPERATOR_OVERRIDE) {
+    logEvent("INFO", "Operator override enabled - skipping safe actuator enforcement.");
+    return;
+  }
+  setRelay(true);
+  setBuzzer(false);
+  setLedColorRed(); // visible critical state
+  logEvent("INFO", "Actuators moved to safe state.");
 }
 
 void checkAlarms(float chamberTemp, float waterTemp, bool soilMoisture) {
   static unsigned long lastBeepTime = 0;
   unsigned long now = millis();
-  if (now - lastBeepTime < 10000 || isnan(chamberTemp) || isnan(waterTemp)) return;
 
-  // Digital soil moisture alarm (HIGH typically means dry)
-  if (soilMoisture == HIGH) {
+  // --- Sensor NaN handling (always check) ---
+  // Chamber sensor
+  if (isnan(chamberTemp)) {
+    // throttle repeated logs/alarms
+    if (now - lastChamberSensorAlarm > SENSOR_NAN_ALARM_REPEAT_MS) {
+      chamberSensorFailCount++;
+      lastChamberSensorAlarm = now;
+      logEvent("ALARM", "Chamber sensor read NaN");
+      displayAlarm("SENSOR ERROR");
+      // brief audible pattern to indicate sensor failure
+      beepPattern(3, 150, 100);
+      // move actuators to safe state if failure persists
+      if (chamberSensorFailCount >= SENSOR_NAN_ALARM_RETRY_COUNT) {
+        if (!chamberPersistentAlarm) {
+          chamberPersistentAlarm = true;
+          logEvent("ALARM", "Chamber sensor persistent failure - escalating to safe mode");
+          setSafeActuators();
+        }
+      }
+    }
+  } else {
+    // successful read: clear counters and persistent state if present
+    if (chamberSensorFailCount > 0 || chamberPersistentAlarm) {
+      chamberSensorFailCount = 0;
+      if (chamberPersistentAlarm) {
+        chamberPersistentAlarm = false;
+        logEvent("INFO", "Chamber sensor recovered");
+      }
+    }
+  }
+
+  // Water sensor
+  if (isnan(waterTemp)) {
+    if (now - lastWaterSensorAlarm > SENSOR_NAN_ALARM_REPEAT_MS) {
+      waterSensorFailCount++;
+      lastWaterSensorAlarm = now;
+      logEvent("ALARM", "Water sensor read NaN");
+      displayAlarm("SENSOR ERROR");
+      beepPattern(3, 150, 100);
+      if (waterSensorFailCount >= SENSOR_NAN_ALARM_RETRY_COUNT) {
+        if (!waterPersistentAlarm) {
+          waterPersistentAlarm = true;
+          logEvent("ALARM", "Water sensor persistent failure - escalating to safe mode");
+          setSafeActuators();
+        }
+      }
+    }
+  } else {
+    if (waterSensorFailCount > 0 || waterPersistentAlarm) {
+      waterSensorFailCount = 0;
+      if (waterPersistentAlarm) {
+        waterPersistentAlarm = false;
+        logEvent("INFO", "Water sensor recovered");
+      }
+    }
+  }
+
+  // If either sensor has escalated to persistent alarm, remain in safe mode and avoid other actuator actions.
+  if (chamberPersistentAlarm || waterPersistentAlarm) {
+    // ensure actuators are in safe state
+    setSafeActuators();
+    return; // do not proceed to normal alarm branching while persistent sensor fault is active
+  }
+
+  // --- Normal alarm branching ---
+  if (now - lastBeepTime < ALARM_DEBOUNCE_MS) return;
+
+  if (soilMoisture == SOIL_DIGITAL_DRY_STATE) {
     displayAlarm("SOIL DRY!");
     beepPattern(7, 60, 60); // Distinct pattern for critically low soil moisture (digital)
+    logEvent("ALARM", "Soil moisture digital indicates DRY");
     lastBeepTime = now;
-  } else if (waterTemp > 28) {
+    return;
+  }
+
+  if (waterTemp > TEMP_HIGH) {
     displayAlarm("WATER TEMP HIGH!");
     beepPattern(5, 50, 50); // Distinct pattern for high water temp
+    logEvent("ALARM", "Water temperature exceeds threshold");
     lastBeepTime = now;
-  } else if (chamberTemp > 29) {
+    return;
+  }
+
+  if (chamberTemp > TEMP_CRITICAL) {
     displayAlarm("CHAMBER TEMP HIGH!");
     beepPattern(4, 80, 80);
+    logEvent("ALARM", "Chamber temperature critical");
     lastBeepTime = now;
-  } else if (chamberTemp > 27) {
+    return;
+  }
+
+  if (chamberTemp > TEMP_WARN) {
     displayAlarm("CHAMBER TEMP WARM");
     beepPattern(3);
+    logEvent("WARN", "Chamber temperature warning");
     lastBeepTime = now;
-  } else if (chamberTemp > 25.5) {
+    return;
+  }
+
+  if (chamberTemp > TEMP_WARM1) {
     displayAlarm("CHAMBER TEMP WARM");
     beepPattern(2);
+    logEvent("WARN", "Chamber temperature warm");
     lastBeepTime = now;
-  } else if (chamberTemp > 24) {
-    displayAlarm("CHAMBER TEMP WARM");
+    return;
+  }
+
+  if (chamberTemp > TEMP_NOTICE) {
+    displayAlarm("CHAMBER TEMP NOTICE");
     beepPattern(1);
+    logEvent("INFO", "Chamber temperature notice");
     lastBeepTime = now;
+    return;
   }
 }
 
 void updateLEDStatus(float chamberTemp, float waterTemp, bool soilMoisture) {
-  // Clear previous LED bits in shiftRegisterState
-  shiftRegisterState &= ~((1 << LED_RED_BIT) | (1 << LED_GREEN_BIT) | (1 << LED_BLUE_BIT));
-
-  // Red (Critical Alarm)
-  if (soilMoisture == HIGH || chamberTemp > 29) {
-    shiftRegisterState |= (1 << LED_RED_BIT); // Red
-  } 
-  // Yellow (Warning)
-  else if (waterTemp > 28 || chamberTemp > 27 || chamberTemp > 25.5 || chamberTemp > 24) {
-    shiftRegisterState |= (1 << LED_RED_BIT) | (1 << LED_GREEN_BIT); // Yellow (Red + Green)
+  if (soilMoisture == SOIL_DIGITAL_DRY_STATE || chamberTemp > TEMP_CRITICAL) {
+    setLedColorRed();
   }
-  // Green (Normal)
+  else if (waterTemp > TEMP_HIGH || chamberTemp > TEMP_WARN) {
+    setLedColorYellow();
+  }
   else {
-    shiftRegisterState |= (1 << LED_GREEN_BIT); // Green
+    setLedColorGreen();
   }
-  updateShiftRegister(shiftRegisterState);
 }
 
 // ---------- Cooling shutdown sequence ----------
 void handleCoolingShutdown(float chamberTemp) {
   if (!coolingShutdownEnabled) return;
 
-  if (chamberTemp > 28 && !coolingOffStage1) {
+  if (chamberTemp > TEMP_HIGH && !coolingOffStage1) {
     Serial.println("ALERT: Chamber too hot. Starting staged shutdown...");
-    shiftRegisterState &= ~(1 << RELAY_BIT);  // turn off peltiers (LOW for relay ON, HIGH for OFF)
-    updateShiftRegister(shiftRegisterState);
+    // Turn off peltiers
+    setRelay(false);
     coolingOffStart = millis();
     coolingOffStage1 = true;
+    logEvent("INFO", "Cooling staged shutdown started");
   }
 
-  if (coolingOffStage1 && (millis() - coolingOffStart > 45000)) {
+  if (coolingOffStage1 && (millis() - coolingOffStart > COOLING_SHUTDOWN_DELAY_MS)) {
     Serial.println("Stage 2: Turning off fans and pump...");
+    logEvent("INFO", "Cooling stage 2 actions executed");
     coolingOffStage1 = false;
   }
 }
@@ -221,24 +391,26 @@ void setup() {
   pinMode(CLOCK_PIN, OUTPUT);
   pinMode(DATA_PIN, OUTPUT);
 
-  // Initialize shift register outputs (all off, relay HIGH for off)
-  shiftRegisterState = (1 << RELAY_BIT); // Set relay bit HIGH (off) initially
-  updateShiftRegister(shiftRegisterState);
+  // Initialize to safe defaults BEFORE any blocking operations
+  setRelay(true);
+  setBuzzer(false);
+  setLedColorYellow();
 
   Wire.begin(); // SDA=D2, SCL=D1
   u8g2.begin();
   u8g2.enableUTF8Print();
 
   titleX = u8g2.getDisplayWidth();  // start scrolling from right
+  logEvent("INFO", "Pine Chamber startup complete. Actuators set to safe defaults.");
 }
 
 // ---------- Loop ----------
 void loop() {
   unsigned long now = millis();
 
-  // ----- Sensor readings every 2 seconds -----
+  // ----- Sensor readings every READ_INTERVAL_MS -----
   static float tIn=0, hIn=0, tOut=0, hOut=0, chamberTemp=0, waterTemp=0;
-  if (now - lastRead >= readInterval) {
+  if (now - lastRead >= READ_INTERVAL_MS) {
     lastRead = now;
 
     // DHT
@@ -257,8 +429,8 @@ void loop() {
     soilMoisture = digitalRead(SOIL_MOISTURE_PIN);
 
     // Serial debug
-    Serial.printf("In: %.1fC %.1f%% | Out: %.1fC %.1f%% | Chamber: %.1fC | Water: %.1fC | Soil Analog: %.0f | Soil Digital: %s\n",
-                  tIn, hIn, tOut, hOut, chamberTemp, waterTemp, soilMoistureAnalog, soilMoisture == HIGH ? "DRY" : "WET");
+    Serial.printf("In: %.1fC %.1f%% | Out: %.1fC %.1f%% | Chamber: %.1fC | Water: %.1fC | Soil Analog: %.0f | Soil Digital: %s",
+                  tIn, hIn, tOut, hOut, chamberTemp, waterTemp, soilMoistureAnalog, soilMoisture == SOIL_DIGITAL_DRY_STATE ? "DRY" : "WET");
 
     // Logic
     checkAlarms(chamberTemp, waterTemp, soilMoisture);
@@ -276,7 +448,7 @@ void loop() {
   u8g2.setFont(u8g2_font_ncenB08_tr);
 
   // Scroll animation (independent)
-  if (now - lastScroll > scrollInterval) {
+  if (now - lastScroll > SCROLL_INTERVAL_MS) {
     titleX -= 2;  // move left
     if (titleX < -u8g2.getUTF8Width(titleText.c_str()))
       titleX = u8g2.getDisplayWidth();
@@ -307,7 +479,7 @@ void loop() {
 
   // Soil Moisture Digital
   printText("Soil D:", 7);
-  rightText(soilMoisture == HIGH ? "DRY" : "WET", 7);
+  rightText(soilMoisture == SOIL_DIGITAL_DRY_STATE ? "DRY" : "WET", 7);
 
   u8g2.sendBuffer();
 }
