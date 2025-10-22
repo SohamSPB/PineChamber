@@ -73,6 +73,22 @@ static byte shiftRegisterState = 0; // single source of truth for shift register
 bool alarmActive = false; // Global variable to track if an alarm is active
 unsigned long alarmStartTime = 0; // Global variable to track when an alarm is activated
 
+// Buzzer state machine
+bool buzzerActive = false;
+unsigned long buzzerOnStart = 0;
+unsigned long buzzerOffStart = 0;
+int buzzerPatternCount = 0;
+int buzzerPatternRemaining = 0;
+int buzzerOnTime = 120;
+int buzzerOffTime = 120;
+bool buzzerIsOn = false;
+
+// Alarm debounce tracking
+bool chamberTempHighAlarmShown = false;
+bool waterTempHighAlarmShown = false;
+bool soilMoistureDryAlarmShown = false;
+bool sensorErrorAlarmShown = false;
+
 // Page switching
 int currentPage = 0;
 unsigned long lastPageSwitch = 0;
@@ -100,14 +116,16 @@ void setLedColorGreen();
 
 void logEvent(const char *level, const char *message);
 void setSafeActuators();
-void centerText(String strr, int lineNo, bool buf);
+void centerText(String strr);
 
 void displayAlarm(String message) {
-  alarmActive = true;
-  alarmStartTime = millis();
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_ncenB10_tr); // Larger font for alarm
-  centerText(message, 3, true);
+  // Only show new alarm if no alarm is currently active
+  // This prevents multiple alarms from interrupting each other
+  if (!alarmActive) {
+    alarmActive = true;
+    alarmStartTime = millis();
+    centerText(message);    
+  }
 }
 
 
@@ -138,12 +156,32 @@ void rightText(String strr, int lineNo, bool buf = false) {
   free(charArray);
 }
 
-void centerText(String strr, int lineNo, bool buf = false) {
-  char *charArray = getChars(strr);
-  u8g2.setCursor((u8g2.getDisplayWidth() - u8g2.getUTF8Width(charArray)) / 2, (lineNo + 1) * 10);
-  u8g2.print(strr);
-  if (buf) u8g2.sendBuffer();
-  free(charArray);
+void centerText(String message) {
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_ncenB10_tr); // Larger font for alarm
+    
+    // Calculate text width to ensure it fits on screen
+    char *charArray = getChars(message);
+    int textWidth = u8g2.getUTF8Width(charArray);
+    int displayWidth = u8g2.getDisplayWidth();
+    
+    // If text is wider than display, try a smaller font
+    if (textWidth >= displayWidth) {
+      u8g2.setFont(u8g2_font_ncenB08_tr); // Smaller font for longer messages
+      textWidth = u8g2.getUTF8Width(charArray);
+    }
+    
+    // Calculate centered position, ensuring it doesn't go negative and text stays on screen
+    int x = max(0, (displayWidth - textWidth) / 2);
+    // Ensure we don't exceed display boundaries when centered
+    if (x + textWidth > displayWidth) {
+      x = 0; // If still too wide, align to left
+    }
+    
+    u8g2.setCursor(x, 35); // Center vertically on screen
+    u8g2.print(message);
+    u8g2.sendBuffer();
+    free(charArray);
 }
 
 // ---------- 74HC595 Helper ----------
@@ -201,12 +239,45 @@ void setLedColorGreen() {
 }
 
 // ---------- Buzzer patterns ----------
-void beepPattern(int count, int onTime = 120, int offTime = 120) {
-  for (int i = 0; i < count; i++) {
-    setBuzzer(true);
-    delay(onTime);
-    setBuzzer(false);
-    delay(offTime);
+void startBuzzerPattern(int count, int onTime = 120, int offTime = 120) {
+  buzzerPatternRemaining = count;
+  buzzerOnTime = onTime;
+  buzzerOffTime = offTime;
+  buzzerActive = true;
+  buzzerIsOn = true;
+  setBuzzer(true);
+  buzzerOnStart = millis();
+}
+
+void updateBuzzerPattern() {
+  if (!buzzerActive) return;
+  
+  unsigned long now = millis();
+  
+  if (buzzerIsOn) {
+    // Currently buzzer is on
+    if (now - buzzerOnStart >= buzzerOnTime) {
+      // Turn buzzer off
+      setBuzzer(false);
+      buzzerIsOn = false;
+      buzzerOffStart = now;
+    }
+  } else {
+    // Currently buzzer is off
+    if (now - buzzerOffStart >= buzzerOffTime) {
+      // Either start next beep or finish pattern
+      buzzerPatternRemaining--;
+      if (buzzerPatternRemaining > 0) {
+        // Start next beep in pattern
+        setBuzzer(true);
+        buzzerIsOn = true;
+        buzzerOnStart = now;
+      } else {
+        // Pattern complete
+        buzzerActive = false;
+        setBuzzer(false);
+      }
+    }
   }
 }
 
@@ -235,6 +306,22 @@ void checkAlarms(float chamberTemp, float waterTemp, bool soilMoisture) {
   static unsigned long lastBeepTime = 0;
   unsigned long now = millis();
 
+  // Clear alarm flags if conditions have returned to normal
+  if (!isnan(chamberTemp) && !isnan(waterTemp)) {
+    sensorErrorAlarmShown = false;
+  }
+  if (waterTemp <= TEMP_HIGH) {
+    waterTempHighAlarmShown = false;
+  }
+#if SOIL_MOISTURE_ENABLED
+  if (soilMoisture != SOIL_DIGITAL_DRY_STATE) {
+    soilMoistureDryAlarmShown = false;
+  }
+#endif
+  if (chamberTemp <= TEMP_NOTICE) { // Clear when below lowest threshold
+    chamberTempHighAlarmShown = false;
+  }
+
   // --- Sensor NaN handling (always check) ---
   // Chamber sensor
   if (isnan(chamberTemp)) {
@@ -243,9 +330,12 @@ void checkAlarms(float chamberTemp, float waterTemp, bool soilMoisture) {
       chamberSensorFailCount++;
       lastChamberSensorAlarm = now;
       logEvent("ALARM", "Chamber sensor read NaN");
-      displayAlarm("SENSOR ERROR");
+      if (!sensorErrorAlarmShown) {
+        displayAlarm("SENSOR ERROR");
+        sensorErrorAlarmShown = true;
+      }
       // brief audible pattern to indicate sensor failure
-      beepPattern(3, 150, 100);
+      startBuzzerPattern(3, 150, 100);
       // move actuators to safe state if failure persists
       if (chamberSensorFailCount >= SENSOR_NAN_ALARM_RETRY_COUNT) {
         if (!chamberPersistentAlarm) {
@@ -272,8 +362,11 @@ void checkAlarms(float chamberTemp, float waterTemp, bool soilMoisture) {
       waterSensorFailCount++;
       lastWaterSensorAlarm = now;
       logEvent("ALARM", "Water sensor read NaN");
-      displayAlarm("SENSOR ERROR");
-      beepPattern(3, 150, 100);
+      if (!sensorErrorAlarmShown) {
+        displayAlarm("SENSOR ERROR");
+        sensorErrorAlarmShown = true;
+      }
+      startBuzzerPattern(3, 150, 100);
       if (waterSensorFailCount >= SENSOR_NAN_ALARM_RETRY_COUNT) {
         if (!waterPersistentAlarm) {
           waterPersistentAlarm = true;
@@ -303,50 +396,56 @@ void checkAlarms(float chamberTemp, float waterTemp, bool soilMoisture) {
   if (now - lastBeepTime < ALARM_DEBOUNCE_MS) return;
 
 #if SOIL_MOISTURE_ENABLED
-  if (soilMoisture == SOIL_DIGITAL_DRY_STATE) {
+  if (soilMoisture == SOIL_DIGITAL_DRY_STATE && !soilMoistureDryAlarmShown) {
     displayAlarm("SOIL DRY!");
-    beepPattern(7, 60, 60); // Distinct pattern for critically low soil moisture (digital)
+    soilMoistureDryAlarmShown = true;
+    startBuzzerPattern(7, 60, 60); // Distinct pattern for critically low soil moisture (digital)
     logEvent("ALARM", "Soil moisture digital indicates DRY");
     lastBeepTime = now;
     return;
   }
 #endif
 
-  if (waterTemp > TEMP_HIGH) {
+  if (waterTemp > TEMP_HIGH && !waterTempHighAlarmShown) {
     displayAlarm("WATER TEMP HIGH!");
-    beepPattern(5, 150, 150); // Distinct pattern for high water temp
+    waterTempHighAlarmShown = true;
+    startBuzzerPattern(5, 150, 150); // Distinct pattern for high water temp
     logEvent("ALARM", "Water temperature exceeds threshold");
     lastBeepTime = now;
     return;
   }
 
-  if (chamberTemp > TEMP_CRITICAL) {
+  if (chamberTemp > TEMP_CRITICAL && !chamberTempHighAlarmShown) {
     displayAlarm("CHAMBER TEMP HIGH!");
-    beepPattern(4, 80, 80);
+    chamberTempHighAlarmShown = true;
+    startBuzzerPattern(4, 80, 80);
     logEvent("ALARM", "Chamber temperature critical");
     lastBeepTime = now;
     return;
   }
 
-  if (chamberTemp > TEMP_WARN) {
+  if (chamberTemp > TEMP_WARN && !chamberTempHighAlarmShown) {
     displayAlarm("CHAMBER TEMP WARM");
-    beepPattern(3);
+    chamberTempHighAlarmShown = true;
+    startBuzzerPattern(3);
     logEvent("WARN", "Chamber temperature warning");
     lastBeepTime = now;
     return;
   }
 
-  if (chamberTemp > TEMP_WARM1) {
+  if (chamberTemp > TEMP_WARM1 && !chamberTempHighAlarmShown) {
     displayAlarm("CHAMBER TEMP WARM");
-    beepPattern(2);
+    chamberTempHighAlarmShown = true;
+    startBuzzerPattern(2);
     logEvent("WARN", "Chamber temperature warm");
     lastBeepTime = now;
     return;
   }
 
-  if (chamberTemp > TEMP_NOTICE) {
+  if (chamberTemp > TEMP_NOTICE && !chamberTempHighAlarmShown) {
     displayAlarm("CHAMBER TEMP NOTICE");
-    beepPattern(1);
+    chamberTempHighAlarmShown = true;
+    startBuzzerPattern(1);
     logEvent("INFO", "Chamber temperature notice");
     lastBeepTime = now;
     return;
@@ -465,9 +564,12 @@ void loop() {
     handleCoolingShutdown(chamberTemp);
   }
 
+  // Update buzzer pattern (non-blocking)
+  updateBuzzerPattern();
+
   // ----- Display -----
   if (alarmActive) {
-    if (millis() - alarmStartTime >= 5000) {
+    if (millis() - alarmStartTime >= ALARM_DISPLAY_TIME_MS) {
       alarmActive = false;
     }
   } else { // Don't switch pages if an alarm is active

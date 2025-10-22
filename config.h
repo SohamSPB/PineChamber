@@ -9,6 +9,7 @@ const unsigned long READ_INTERVAL_MS           = 2000UL;   // sensor read interv
 const unsigned long SCROLL_INTERVAL_MS         = 40UL;     // title scroll interval
 const unsigned long ALARM_DEBOUNCE_MS          = 10000UL;  // min gap between alarm repeats
 const unsigned long PAGE_SWITCH_INTERVAL_MS    = 5000UL;   // display page switch interval
+const unsigned long ALARM_DISPLAY_TIME_MS      = 10000UL;  // time alarm message is displayed (10 seconds)
 
 // Temperature thresholds (C)
 const float TEMP_CRITICAL = 29.0f;   // critical alarm
