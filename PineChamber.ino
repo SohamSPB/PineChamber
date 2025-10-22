@@ -72,6 +72,7 @@ bool soilMoisture = HIGH; // Variable to store digital soil moisture reading (HI
 static byte shiftRegisterState = 0; // single source of truth for shift register output bits
 bool alarmActive = false; // Global variable to track if an alarm is active
 unsigned long alarmStartTime = 0; // Global variable to track when an alarm is activated
+String currentAlarmMessage = ""; // Store the current alarm message to display repeatedly
 
 // Buzzer state machine
 bool buzzerActive = false;
@@ -83,11 +84,6 @@ int buzzerOnTime = 120;
 int buzzerOffTime = 120;
 bool buzzerIsOn = false;
 
-// Alarm debounce tracking
-bool chamberTempHighAlarmShown = false;
-bool waterTempHighAlarmShown = false;
-bool soilMoistureDryAlarmShown = false;
-bool sensorErrorAlarmShown = false;
 
 // Page switching
 int currentPage = 0;
@@ -119,13 +115,11 @@ void setSafeActuators();
 void centerText(String strr);
 
 void displayAlarm(String message) {
-  // Only show new alarm if no alarm is currently active
-  // This prevents multiple alarms from interrupting each other
-  if (!alarmActive) {
-    alarmActive = true;
-    alarmStartTime = millis();
-    centerText(message);    
-  }
+  // Update the alarm display with new message
+  alarmActive = true;
+  alarmStartTime = millis();
+  currentAlarmMessage = message;
+  centerText(message);  // Use the corrected centerText function
 }
 
 
@@ -306,22 +300,6 @@ void checkAlarms(float chamberTemp, float waterTemp, bool soilMoisture) {
   static unsigned long lastBeepTime = 0;
   unsigned long now = millis();
 
-  // Clear alarm flags if conditions have returned to normal
-  if (!isnan(chamberTemp) && !isnan(waterTemp)) {
-    sensorErrorAlarmShown = false;
-  }
-  if (waterTemp <= TEMP_HIGH) {
-    waterTempHighAlarmShown = false;
-  }
-#if SOIL_MOISTURE_ENABLED
-  if (soilMoisture != SOIL_DIGITAL_DRY_STATE) {
-    soilMoistureDryAlarmShown = false;
-  }
-#endif
-  if (chamberTemp <= TEMP_NOTICE) { // Clear when below lowest threshold
-    chamberTempHighAlarmShown = false;
-  }
-
   // --- Sensor NaN handling (always check) ---
   // Chamber sensor
   if (isnan(chamberTemp)) {
@@ -330,10 +308,7 @@ void checkAlarms(float chamberTemp, float waterTemp, bool soilMoisture) {
       chamberSensorFailCount++;
       lastChamberSensorAlarm = now;
       logEvent("ALARM", "Chamber sensor read NaN");
-      if (!sensorErrorAlarmShown) {
-        displayAlarm("SENSOR ERROR");
-        sensorErrorAlarmShown = true;
-      }
+      displayAlarm("SENSOR ERROR");
       // brief audible pattern to indicate sensor failure
       startBuzzerPattern(3, 150, 100);
       // move actuators to safe state if failure persists
@@ -362,10 +337,7 @@ void checkAlarms(float chamberTemp, float waterTemp, bool soilMoisture) {
       waterSensorFailCount++;
       lastWaterSensorAlarm = now;
       logEvent("ALARM", "Water sensor read NaN");
-      if (!sensorErrorAlarmShown) {
-        displayAlarm("SENSOR ERROR");
-        sensorErrorAlarmShown = true;
-      }
+      displayAlarm("SENSOR ERROR");
       startBuzzerPattern(3, 150, 100);
       if (waterSensorFailCount >= SENSOR_NAN_ALARM_RETRY_COUNT) {
         if (!waterPersistentAlarm) {
@@ -396,9 +368,8 @@ void checkAlarms(float chamberTemp, float waterTemp, bool soilMoisture) {
   if (now - lastBeepTime < ALARM_DEBOUNCE_MS) return;
 
 #if SOIL_MOISTURE_ENABLED
-  if (soilMoisture == SOIL_DIGITAL_DRY_STATE && !soilMoistureDryAlarmShown) {
+  if (soilMoisture == SOIL_DIGITAL_DRY_STATE) {
     displayAlarm("SOIL DRY!");
-    soilMoistureDryAlarmShown = true;
     startBuzzerPattern(7, 60, 60); // Distinct pattern for critically low soil moisture (digital)
     logEvent("ALARM", "Soil moisture digital indicates DRY");
     lastBeepTime = now;
@@ -406,45 +377,40 @@ void checkAlarms(float chamberTemp, float waterTemp, bool soilMoisture) {
   }
 #endif
 
-  if (waterTemp > TEMP_HIGH && !waterTempHighAlarmShown) {
+  if (waterTemp > TEMP_HIGH) {
     displayAlarm("WATER TEMP HIGH!");
-    waterTempHighAlarmShown = true;
     startBuzzerPattern(5, 150, 150); // Distinct pattern for high water temp
     logEvent("ALARM", "Water temperature exceeds threshold");
     lastBeepTime = now;
     return;
   }
 
-  if (chamberTemp > TEMP_CRITICAL && !chamberTempHighAlarmShown) {
+  if (chamberTemp > TEMP_CRITICAL) {
     displayAlarm("CHAMBER TEMP HIGH!");
-    chamberTempHighAlarmShown = true;
     startBuzzerPattern(4, 80, 80);
     logEvent("ALARM", "Chamber temperature critical");
     lastBeepTime = now;
     return;
   }
 
-  if (chamberTemp > TEMP_WARN && !chamberTempHighAlarmShown) {
+  if (chamberTemp > TEMP_WARN) {
     displayAlarm("CHAMBER TEMP WARM");
-    chamberTempHighAlarmShown = true;
     startBuzzerPattern(3);
     logEvent("WARN", "Chamber temperature warning");
     lastBeepTime = now;
     return;
   }
 
-  if (chamberTemp > TEMP_WARM1 && !chamberTempHighAlarmShown) {
+  if (chamberTemp > TEMP_WARM1) {
     displayAlarm("CHAMBER TEMP WARM");
-    chamberTempHighAlarmShown = true;
     startBuzzerPattern(2);
     logEvent("WARN", "Chamber temperature warm");
     lastBeepTime = now;
     return;
   }
 
-  if (chamberTemp > TEMP_NOTICE && !chamberTempHighAlarmShown) {
+  if (chamberTemp > TEMP_NOTICE) {
     displayAlarm("CHAMBER TEMP NOTICE");
-    chamberTempHighAlarmShown = true;
     startBuzzerPattern(1);
     logEvent("INFO", "Chamber temperature notice");
     lastBeepTime = now;
@@ -580,19 +546,24 @@ void loop() {
   }
 
   u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_ncenB08_tr);
+  
+  // Show alarm message when alarm is active
+  if (alarmActive) {
+    centerText(currentAlarmMessage);
+  } else {
+    u8g2.setFont(u8g2_font_ncenB08_tr);
 
-  // Scroll animation (independent)
-  if (now - lastScroll > SCROLL_INTERVAL_MS) {
-    titleX -= 2;  // move left
-    if (titleX < -u8g2.getUTF8Width(titleText.c_str()))
-      titleX = u8g2.getDisplayWidth();
-    lastScroll = now;
-  }
-  u8g2.setCursor(titleX, 10);
-  u8g2.print(titleText);
+    // Scroll animation (independent)
+    if (now - lastScroll > SCROLL_INTERVAL_MS) {
+      titleX -= 2;  // move left
+      if (titleX < -u8g2.getUTF8Width(titleText.c_str()))
+        titleX = u8g2.getDisplayWidth();
+      lastScroll = now;
+    }
+    u8g2.setCursor(titleX, 10);
+    u8g2.print(titleText);
 
-  if (currentPage == 0) {
+    if (currentPage == 0) {
     // Inside
     printText("In:", 2);
     rightText(!isnan(tIn)&&!isnan(hIn)? String(tIn,1)+"C "+String((int)hIn)+"%":"Err", 2);
@@ -659,6 +630,6 @@ void loop() {
     rightText("", 5);
 #endif
   }
-
+  }
   u8g2.sendBuffer();
 }
