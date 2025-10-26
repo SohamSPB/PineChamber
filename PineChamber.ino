@@ -13,13 +13,13 @@
 // D3: ONE_WIRE_BUS (DS18B20s)
 // D4: DHTPIN_INSIDE (DHT22)
 // D5: DHTPIN_OUTSIDE (DHT22)
-// D6: LATCH_PIN (74HC595)
-// D7: CLOCK_PIN (74HC595)
-// D8: DATA_PIN (74HC595)
+// D6: LATCH_PIN (74HC595 ST_CP(12) )
+// D7: CLOCK_PIN (74HC595 SH_CP(11) )
+// D8: DATA_PIN (74HC595 DS(14) ) 
 // 74HC595 Outputs:
 //   Bit 0: Red LED
-//   Bit 1: Green LED
-//   Bit 2: Blue LED
+//   Bit 1: Blue LED
+//   Bit 2: Green LED
 //   Bit 3: Peltier (via relay)
 //   Bit 4: Buzzer
 
@@ -38,8 +38,8 @@
 
 // 74HC595 Output Bit Assignments
 #define LED_RED_BIT 0
-#define LED_GREEN_BIT 1
-#define LED_BLUE_BIT 2
+#define LED_BLUE_BIT 1
+#define  LED_GREEN_BIT 2
 #define PELTIER_BIT 3
 #define BUZZER_BIT 4
 
@@ -72,6 +72,22 @@ bool soilMoisture = HIGH; // Variable to store digital soil moisture reading (HI
 static byte shiftRegisterState = 0; // single source of truth for shift register output bits
 bool alarmActive = false; // Global variable to track if an alarm is active
 unsigned long alarmStartTime = 0; // Global variable to track when an alarm is activated
+String currentAlarmMessage = ""; // Store the current alarm message to display repeatedly
+
+// Buzzer state machine
+bool buzzerActive = false;
+unsigned long buzzerOnStart = 0;
+unsigned long buzzerOffStart = 0;
+int buzzerPatternCount = 0;
+int buzzerPatternRemaining = 0;
+int buzzerOnTime = 120;
+int buzzerOffTime = 120;
+bool buzzerIsOn = false;
+
+
+// Page switching
+int currentPage = 0;
+unsigned long lastPageSwitch = 0;
 
 // Operator override for bench testing. Default false.
 bool OPERATOR_OVERRIDE = false;
@@ -96,14 +112,14 @@ void setLedColorGreen();
 
 void logEvent(const char *level, const char *message);
 void setSafeActuators();
-void centerText(String strr, int lineNo, bool buf);
+void centerText(String strr);
 
 void displayAlarm(String message) {
+  // Update the alarm display with new message
   alarmActive = true;
   alarmStartTime = millis();
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_ncenB10_tr); // Larger font for alarm
-  centerText(message, 3, true);
+  currentAlarmMessage = message;
+  centerText(message);  // Use the corrected centerText function
 }
 
 
@@ -134,16 +150,39 @@ void rightText(String strr, int lineNo, bool buf = false) {
   free(charArray);
 }
 
-void centerText(String strr, int lineNo, bool buf = false) {
-  char *charArray = getChars(strr);
-  u8g2.setCursor((u8g2.getDisplayWidth() - u8g2.getUTF8Width(charArray)) / 2, (lineNo + 1) * 10);
-  u8g2.print(strr);
-  if (buf) u8g2.sendBuffer();
-  free(charArray);
+void centerText(String message) {
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_ncenB10_tr); // Larger font for alarm
+    
+    // Calculate text width to ensure it fits on screen
+    char *charArray = getChars(message);
+    int textWidth = u8g2.getUTF8Width(charArray);
+    int displayWidth = u8g2.getDisplayWidth();
+    
+    // If text is wider than display, try a smaller font
+    if (textWidth >= displayWidth) {
+      u8g2.setFont(u8g2_font_ncenB08_tr); // Smaller font for longer messages
+      textWidth = u8g2.getUTF8Width(charArray);
+    }
+    
+    // Calculate centered position, ensuring it doesn't go negative and text stays on screen
+    int x = max(0, (displayWidth - textWidth) / 2);
+    // Ensure we don't exceed display boundaries when centered
+    if (x + textWidth > displayWidth) {
+      x = 0; // If still too wide, align to left
+    }
+    
+    u8g2.setCursor(x, 35); // Center vertically on screen
+    u8g2.print(message);
+    u8g2.sendBuffer();
+    free(charArray);
 }
 
 // ---------- 74HC595 Helper ----------
 void updateShiftRegister(byte value) {
+#if INVERT_SHIFT_REGISTER_OUTPUTS
+    value = ~value;
+#endif
   digitalWrite(LATCH_PIN, LOW);
   shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, value);
   digitalWrite(LATCH_PIN, HIGH);
@@ -165,43 +204,74 @@ bool sr_getBit(uint8_t bit) {
 }
 
 void setPeltier(bool on) {
-  // Determine which physical level corresponds to logical 'on'
-  bool onLevel = (PELTIER_ON == HIGH);
-  bool level = on ? onLevel : (PELTIER_OFF == HIGH);
-  sr_setBit(PELTIER_BIT, level);
+  sr_setBit(PELTIER_BIT, on);
 }
 
 void setBuzzer(bool on) {
-  bool onLevel = (BUZZER_ON == HIGH);
-  bool level = on ? onLevel : (BUZZER_OFF == HIGH);
-  sr_setBit(BUZZER_BIT, level);
+  sr_setBit(BUZZER_BIT, on);
 }
 
 void setLedColorRed() {
   uint8_t mask = (1 << LED_RED_BIT) | (1 << LED_GREEN_BIT) | (1 << LED_BLUE_BIT);
   uint8_t vals = (1 << LED_RED_BIT);
+  Serial.printf("setting color to red");
   sr_applyBits(mask, vals);
 }
 
 void setLedColorYellow() {
   uint8_t mask = (1 << LED_RED_BIT) | (1 << LED_GREEN_BIT) | (1 << LED_BLUE_BIT);
   uint8_t vals = (1 << LED_RED_BIT) | (1 << LED_GREEN_BIT);
+  Serial.printf("setting color to yellow");
   sr_applyBits(mask, vals);
 }
 
 void setLedColorGreen() {
   uint8_t mask = (1 << LED_RED_BIT) | (1 << LED_GREEN_BIT) | (1 << LED_BLUE_BIT);
   uint8_t vals = (1 << LED_GREEN_BIT);
+  Serial.printf("setting color to green");
   sr_applyBits(mask, vals);
 }
 
 // ---------- Buzzer patterns ----------
-void beepPattern(int count, int onTime = 120, int offTime = 120) {
-  for (int i = 0; i < count; i++) {
-    setBuzzer(true);
-    delay(onTime);
-    setBuzzer(false);
-    delay(offTime);
+void startBuzzerPattern(int count, int onTime = 120, int offTime = 120) {
+  buzzerPatternRemaining = count;
+  buzzerOnTime = onTime;
+  buzzerOffTime = offTime;
+  buzzerActive = true;
+  buzzerIsOn = true;
+  setBuzzer(true);
+  buzzerOnStart = millis();
+}
+
+void updateBuzzerPattern() {
+  if (!buzzerActive) return;
+  
+  unsigned long now = millis();
+  
+  if (buzzerIsOn) {
+    // Currently buzzer is on
+    if (now - buzzerOnStart >= buzzerOnTime) {
+      // Turn buzzer off
+      setBuzzer(false);
+      buzzerIsOn = false;
+      buzzerOffStart = now;
+    }
+  } else {
+    // Currently buzzer is off
+    if (now - buzzerOffStart >= buzzerOffTime) {
+      // Either start next beep or finish pattern
+      buzzerPatternRemaining--;
+      if (buzzerPatternRemaining > 0) {
+        // Start next beep in pattern
+        setBuzzer(true);
+        buzzerIsOn = true;
+        buzzerOnStart = now;
+      } else {
+        // Pattern complete
+        buzzerActive = false;
+        setBuzzer(false);
+      }
+    }
   }
 }
 
@@ -240,7 +310,7 @@ void checkAlarms(float chamberTemp, float waterTemp, bool soilMoisture) {
       logEvent("ALARM", "Chamber sensor read NaN");
       displayAlarm("SENSOR ERROR");
       // brief audible pattern to indicate sensor failure
-      beepPattern(3, 150, 100);
+      startBuzzerPattern(3, 150, 100);
       // move actuators to safe state if failure persists
       if (chamberSensorFailCount >= SENSOR_NAN_ALARM_RETRY_COUNT) {
         if (!chamberPersistentAlarm) {
@@ -268,7 +338,7 @@ void checkAlarms(float chamberTemp, float waterTemp, bool soilMoisture) {
       lastWaterSensorAlarm = now;
       logEvent("ALARM", "Water sensor read NaN");
       displayAlarm("SENSOR ERROR");
-      beepPattern(3, 150, 100);
+      startBuzzerPattern(3, 150, 100);
       if (waterSensorFailCount >= SENSOR_NAN_ALARM_RETRY_COUNT) {
         if (!waterPersistentAlarm) {
           waterPersistentAlarm = true;
@@ -297,17 +367,19 @@ void checkAlarms(float chamberTemp, float waterTemp, bool soilMoisture) {
   // --- Normal alarm branching ---
   if (now - lastBeepTime < ALARM_DEBOUNCE_MS) return;
 
+#if SOIL_MOISTURE_ENABLED
   if (soilMoisture == SOIL_DIGITAL_DRY_STATE) {
     displayAlarm("SOIL DRY!");
-    beepPattern(7, 60, 60); // Distinct pattern for critically low soil moisture (digital)
+    startBuzzerPattern(7, 60, 60); // Distinct pattern for critically low soil moisture (digital)
     logEvent("ALARM", "Soil moisture digital indicates DRY");
     lastBeepTime = now;
     return;
   }
+#endif
 
   if (waterTemp > TEMP_HIGH) {
     displayAlarm("WATER TEMP HIGH!");
-    beepPattern(5, 50, 50); // Distinct pattern for high water temp
+    startBuzzerPattern(5, 150, 150); // Distinct pattern for high water temp
     logEvent("ALARM", "Water temperature exceeds threshold");
     lastBeepTime = now;
     return;
@@ -315,7 +387,7 @@ void checkAlarms(float chamberTemp, float waterTemp, bool soilMoisture) {
 
   if (chamberTemp > TEMP_CRITICAL) {
     displayAlarm("CHAMBER TEMP HIGH!");
-    beepPattern(4, 80, 80);
+    startBuzzerPattern(4, 80, 80);
     logEvent("ALARM", "Chamber temperature critical");
     lastBeepTime = now;
     return;
@@ -323,7 +395,7 @@ void checkAlarms(float chamberTemp, float waterTemp, bool soilMoisture) {
 
   if (chamberTemp > TEMP_WARN) {
     displayAlarm("CHAMBER TEMP WARM");
-    beepPattern(3);
+    startBuzzerPattern(3);
     logEvent("WARN", "Chamber temperature warning");
     lastBeepTime = now;
     return;
@@ -331,7 +403,7 @@ void checkAlarms(float chamberTemp, float waterTemp, bool soilMoisture) {
 
   if (chamberTemp > TEMP_WARM1) {
     displayAlarm("CHAMBER TEMP WARM");
-    beepPattern(2);
+    startBuzzerPattern(2);
     logEvent("WARN", "Chamber temperature warm");
     lastBeepTime = now;
     return;
@@ -339,7 +411,7 @@ void checkAlarms(float chamberTemp, float waterTemp, bool soilMoisture) {
 
   if (chamberTemp > TEMP_NOTICE) {
     displayAlarm("CHAMBER TEMP NOTICE");
-    beepPattern(1);
+    startBuzzerPattern(1);
     logEvent("INFO", "Chamber temperature notice");
     lastBeepTime = now;
     return;
@@ -347,9 +419,15 @@ void checkAlarms(float chamberTemp, float waterTemp, bool soilMoisture) {
 }
 
 void updateLEDStatus(float chamberTemp, float waterTemp, bool soilMoisture) {
+#if SOIL_MOISTURE_ENABLED
   if (soilMoisture == SOIL_DIGITAL_DRY_STATE || chamberTemp > TEMP_CRITICAL) {
     setLedColorRed();
   }
+#else
+  if (chamberTemp > TEMP_CRITICAL) {
+    setLedColorRed();
+  }
+#endif
   else if (waterTemp > TEMP_HIGH || chamberTemp > TEMP_WARN) {
     setLedColorYellow();
   }
@@ -385,7 +463,9 @@ void setup() {
   dhtOutside.begin();
   ds.begin();
 
+#if SOIL_MOISTURE_ENABLED
   pinMode(SOIL_MOISTURE_PIN, INPUT_PULLUP); // Digital soil moisture pin as input with pullup
+#endif
 
   // Initialize 74HC595 pins
   pinMode(LATCH_PIN, OUTPUT);
@@ -425,62 +505,131 @@ void loop() {
     chamberTemp = ds.getTempC(chamberSensor);
     waterTemp = ds.getTempC(waterSensor);
 
+#if SOIL_MOISTURE_ENABLED
     // Soil Moisture
     soilMoistureAnalog = analogRead(SOIL_MOISTURE_ANALOG_PIN);
     soilMoisture = digitalRead(SOIL_MOISTURE_PIN);
-
+    
     // Serial debug
-    Serial.printf("In: %.1fC %.1f%% | Out: %.1fC %.1f%% | Chamber: %.1fC | Water: %.1fC | Soil Analog: %.0f | Soil Digital: %s",
+    Serial.printf("In: %.1fC %.1f%% | Out: %.1fC %.1f%% | Chamber: %.1fC | Water: %.1fC | Soil Analog: %.0f | Soil Digital: %s\n",
                   tIn, hIn, tOut, hOut, chamberTemp, waterTemp, soilMoistureAnalog, soilMoisture == SOIL_DIGITAL_DRY_STATE ? "DRY" : "WET");
+#else
+    // Serial debug (without soil moisture)
+    Serial.printf("In: %.1fC %.1f%% | Out: %.1fC %.1f%% | Chamber: %.1fC | Water: %.1fC\n",
+                  tIn, hIn, tOut, hOut, chamberTemp, waterTemp);
+#endif
 
     // Logic
+#if SOIL_MOISTURE_ENABLED
     checkAlarms(chamberTemp, waterTemp, soilMoisture);
     updateLEDStatus(chamberTemp, waterTemp, soilMoisture);
+#else
+    checkAlarms(chamberTemp, waterTemp, HIGH); // Pass default HIGH value when soil sensor is disabled
+    updateLEDStatus(chamberTemp, waterTemp, HIGH); // Pass default HIGH value when soil sensor is disabled
+#endif
     handleCoolingShutdown(chamberTemp);
   }
 
+  // Update buzzer pattern (non-blocking)
+  updateBuzzerPattern();
+
   // ----- Display -----
   if (alarmActive) {
-    if (millis() - alarmStartTime >= 5000) {
+    if (millis() - alarmStartTime >= ALARM_DISPLAY_TIME_MS) {
       alarmActive = false;
     }
+  } else { // Don't switch pages if an alarm is active
+      if (now - lastPageSwitch >= PAGE_SWITCH_INTERVAL_MS) {
+        lastPageSwitch = now;
+        currentPage = (currentPage + 1) % 2;
+      }
   }
+
   u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_ncenB08_tr);
+  
+  // Show alarm message when alarm is active
+  if (alarmActive) {
+    centerText(currentAlarmMessage);
+  } else {
+    u8g2.setFont(u8g2_font_ncenB08_tr);
 
-  // Scroll animation (independent)
-  if (now - lastScroll > SCROLL_INTERVAL_MS) {
-    titleX -= 2;  // move left
-    if (titleX < -u8g2.getUTF8Width(titleText.c_str()))
-      titleX = u8g2.getDisplayWidth();
-    lastScroll = now;
+    // Scroll animation (independent)
+    if (now - lastScroll > SCROLL_INTERVAL_MS) {
+      titleX -= 2;  // move left
+      if (titleX < -u8g2.getUTF8Width(titleText.c_str()))
+        titleX = u8g2.getDisplayWidth();
+      lastScroll = now;
+    }
+    u8g2.setCursor(titleX, 10);
+    u8g2.print(titleText);
+
+    if (currentPage == 0) {
+    // Inside
+    printText("In:", 2);
+    rightText(!isnan(tIn)&&!isnan(hIn)? String(tIn,1)+"C "+String((int)hIn)+"%":"Err", 2);
+
+    // Outside
+    printText("Out:", 3);
+    rightText(!isnan(tOut)&&!isnan(hOut)? String(tOut,1)+"C "+String((int)hOut)+"%":"Err", 3);
+
+    // Chamber
+    printText("Chamber:", 4);
+    rightText(chamberTemp>-100? String(chamberTemp,1)+"C":"Err", 4);
+
+    // Water
+    printText("Water:", 5);
+    rightText(waterTemp>-100? String(waterTemp,1)+"C":"Err", 5);
+  } else { // page 1
+#if SOIL_MOISTURE_ENABLED
+    // Soil Moisture Analog
+    printText("Soil A:", 2);
+    rightText(String((int)soilMoistureAnalog), 2);
+
+    // Soil Moisture Digital
+    printText("Soil D:", 3);
+    rightText(soilMoisture == SOIL_DIGITAL_DRY_STATE ? "DRY" : "WET", 3);
+    
+    // Uptime
+    unsigned long total_seconds = millis() / 1000;
+    unsigned long days = total_seconds / (24 * 3600);
+    total_seconds %= (24 * 3600);
+    unsigned long hours = total_seconds / 3600;
+    total_seconds %= 3600;
+    unsigned long minutes = total_seconds / 60;
+
+    char uptime_buf[20];
+    snprintf(uptime_buf, sizeof(uptime_buf), "%lud %02luh %02lum", days, hours, minutes);
+    printText("Uptime:", 4);
+    rightText(uptime_buf, 4);
+
+    // Status
+    printText("Cooling:", 5);
+    rightText(sr_getBit(PELTIER_BIT) ? "ON" : "OFF", 5);
+#else
+    // Uptime (no soil moisture display)
+    unsigned long total_seconds = millis() / 1000;
+    unsigned long days = total_seconds / (24 * 3600);
+    total_seconds %= (24 * 3600);
+    unsigned long hours = total_seconds / 3600;
+    total_seconds %= 3600;
+    unsigned long minutes = total_seconds / 60;
+
+    char uptime_buf[20];
+    snprintf(uptime_buf, sizeof(uptime_buf), "%lud %02luh %02lum", days, hours, minutes);
+    printText("Uptime:", 2);
+    rightText(uptime_buf, 2);
+
+    // Status
+    printText("Cooling:", 3);
+    rightText(sr_getBit(PELTIER_BIT) ? "ON" : "OFF", 3);
+    
+    // Empty lines to maintain layout consistency
+    printText("", 4);
+    rightText("", 4);
+    printText("", 5);
+    rightText("", 5);
+#endif
   }
-  u8g2.setCursor(titleX, 10);
-  u8g2.print(titleText);
-
-  // Inside
-  printText("In:", 2);
-  rightText(!isnan(tIn)&&!isnan(hIn)? String(tIn,1)+"C "+String((int)hIn)+"%":"Err", 2);
-
-  // Outside
-  printText("Out:", 3);
-  rightText(!isnan(tOut)&&!isnan(hOut)? String(tOut,1)+"C "+String((int)hOut)+"%":"Err", 3);
-
-  // Chamber
-  printText("Chamber:", 4);
-  rightText(chamberTemp>-100? String(chamberTemp,1)+"C":"Err", 4);
-
-  // Water
-  printText("Water:", 5);
-  rightText(waterTemp>-100? String(waterTemp,1)+"C":"Err", 5);
-
-  // Soil Moisture Analog
-  printText("Soil A:", 6);
-  rightText(String((int)soilMoistureAnalog), 6);
-
-  // Soil Moisture Digital
-  printText("Soil D:", 7);
-  rightText(soilMoisture == SOIL_DIGITAL_DRY_STATE ? "DRY" : "WET", 7);
-
+  }
   u8g2.sendBuffer();
 }
