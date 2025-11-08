@@ -4,19 +4,36 @@
 #include <DHT.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include "TM1638.h"
 
 
-// A0: SOIL_MOISTURE_ANALOG_PIN (HW-080 analog reading)
-// D0: SOIL_MOISTURE_PIN (HW-080 digital reading)
-// D1: SCL (OLED)
-// D2: SDA (OLED)
-// D3: ONE_WIRE_BUS (DS18B20s)
-// D4: DHTPIN_INSIDE (DHT22)
-// D5: DHTPIN_OUTSIDE (DHT22)
-// D6: LATCH_PIN (74HC595 ST_CP(12) )
-// D7: CLOCK_PIN (74HC595 SH_CP(11) )
-// D8: DATA_PIN (74HC595 DS(14) ) 
-// 74HC595 Outputs:
+// PINOUT RATIONALE:
+// This pinout is carefully designed to accommodate all peripherals on the NodeMCU ESP8266,
+// specifically addressing the sensitive boot requirements of GPIO0 (D3), GPIO2 (D4), and GPIO15 (D8).
+//
+// A0: SOIL_MOISTURE_ANALOG_PIN (Analog input for soil moisture sensor)
+// D0 (GPIO16): DATA_PIN (74HC595 DS(14)) - Safe general-purpose I/O.
+//
+// D1 (GPIO5): SCL (OLED I2C) - Standard hardware I2C pin, safe.
+// D2 (GPIO4): SDA (OLED I2C) - Standard hardware I2C pin, safe.
+// D3 (GPIO0): ONE_WIRE_BUS (DS18B20s)
+//             - Boot Requirement: Must be HIGH at boot.
+//             - Reasoning: OneWire bus typically uses a pull-up resistor, ensuring this pin is HIGH.
+// D4 (GPIO2): TM_STB (TM1638 Strobe)
+//             - Boot Requirement: Must be HIGH at boot.
+//             - Reasoning: The TM1638 library initializes this pin as an output and sets it HIGH,
+//                          perfectly matching the GPIO2 boot requirement.
+// D5 (GPIO14): DHTPIN_OUTSIDE (DHT22) - Safe general-purpose I/O.
+// D6 (GPIO12): TM_DIO (TM1638 Data In/Out) - Safe general-purpose I/O, suitable for bidirectional communication.
+// D7 (GPIO13): SHARED_CLOCK_PIN (74HC595 SH_CP(11) & TM1638 CLK)
+//             - Reasoning: GPIO13 is a safe general-purpose I/O. Sharing the clock works because
+//                          only one device is addressed at a time via its STB/LATCH pin.
+// D8 (GPIO15): LATCH_PIN (74HC595 ST_CP(12))
+//             - Boot Requirement: Must be LOW at boot.
+//             - Reasoning: This pin is configured as an output and explicitly set LOW in setup()
+//                          immediately, satisfying the GPIO15 boot requirement.
+//
+// 74HC595 Outputs (controlled via LATCH_PIN, CLOCK_PIN, DATA_PIN):
 //   Bit 0: Red LED
 //   Bit 1: Blue LED
 //   Bit 2: Green LED
@@ -25,16 +42,22 @@
 
 // ---------- Pin Config ----------
 #define ONE_WIRE_BUS D3
-#define DHTPIN_INSIDE D4
+// #define DHTPIN_INSIDE D4 // REMOVED, replaced by DS18B20
 #define DHTPIN_OUTSIDE D5
 #define DHTTYPE DHT22
 #define SOIL_MOISTURE_ANALOG_PIN A0 // Analog pin for soil moisture sensor
-#define SOIL_MOISTURE_PIN D0 // Digital pin for soil moisture sensor
+// #define SOIL_MOISTURE_PIN D0 // REMOVED to free up pin, using analog reading only
+#define SOIL_ANALOG_DRY_THRESHOLD 750 // ADC value above which soil is considered "DRY". Adjust as needed.
 
 // 74HC595 Shift Register Pins
-#define LATCH_PIN D6
+#define LATCH_PIN D8
 #define CLOCK_PIN D7
-#define DATA_PIN D8
+#define DATA_PIN D0
+
+// TM1638 Display Pins
+#define TM_STB D4
+#define TM_CLK D7 // SHARED with 74HC595 CLOCK_PIN
+#define TM_DIO D6
 
 // 74HC595 Output Bit Assignments
 #define LED_RED_BIT 0
@@ -44,14 +67,16 @@
 #define BUZZER_BIT 4
 
 // ---------- Sensors ----------
-DHT dhtInside(DHTPIN_INSIDE, DHTTYPE);
+// DHT dhtInside(DHTPIN_INSIDE, DHTTYPE); // REMOVED
 DHT dhtOutside(DHTPIN_OUTSIDE, DHTTYPE);
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature ds(&oneWire);
+TM1638 module(TM_CLK, TM_DIO, TM_STB);
 
 // DS18B20 addresses
 DeviceAddress chamberSensor = { 0x28, 0xE0, 0xE6, 0x57, 0x04, 0xE1, 0x3C, 0x1D };
 DeviceAddress waterSensor   = { 0x28, 0x01, 0x96, 0x43, 0xD4, 0xE1, 0x3D, 0x1F };
+DeviceAddress insideSensor  = { 0x28, 0x89, 0x84, 0xBC, 0x00, 0x00, 0x00, 0x35 };
 
 // ---------- OLED ----------
 #ifdef U8x8_HAVE_HW_I2C
@@ -61,6 +86,7 @@ U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/U8X8_PIN_NONE);
 
 // ---------- Timing ----------
 unsigned long lastRead = 0;
+const unsigned long ALARM_PAGE_TOGGLE_INTERVAL_MS = 5000; // 5 seconds
 
 // ---------- State ----------
 int dotCount = 0;
@@ -68,11 +94,20 @@ bool coolingShutdownEnabled = false;
 bool coolingOffStage1 = false;
 unsigned long coolingOffStart = 0;
 float soilMoistureAnalog = 0; // Variable to store analog soil moisture reading
-bool soilMoisture = HIGH; // Variable to store digital soil moisture reading (HIGH for dry, LOW for wet, typically)
+bool soilIsDry = false; // Derived from analog reading. True if soil is dry.
 static byte shiftRegisterState = 0; // single source of truth for shift register output bits
 bool alarmActive = false; // Global variable to track if an alarm is active
 unsigned long alarmStartTime = 0; // Global variable to track when an alarm is activated
 String currentAlarmMessage = ""; // Store the current alarm message to display repeatedly
+
+// TM1638 LED & Button Feature State
+enum LedState { NORMAL, WARNING, CRITICAL };
+LedState currentLedState = NORMAL;
+bool blinkLedState = false;
+unsigned long lastBlinkTime = 0;
+bool buzzerSilenced = false;
+bool showAlarmPage = false; // Toggles between alarm and data pages during an alarm
+unsigned long lastAlarmPageToggle = 0; // Timer for the alarm page toggle
 
 // Buzzer state machine
 bool buzzerActive = false;
@@ -109,6 +144,7 @@ void setBuzzer(bool on);
 void setLedColorRed();
 void setLedColorYellow();
 void setLedColorGreen();
+void updateTm1638Display(float chamberTemp, float outsideTemp);
 
 void logEvent(const char *level, const char *message);
 void setSafeActuators();
@@ -119,6 +155,12 @@ void displayAlarm(String message) {
   alarmActive = true;
   alarmStartTime = millis();
   currentAlarmMessage = message;
+  buzzerSilenced = false; // Ensure new alarms are not silenced by default
+
+  // Reset alarm display toggling
+  showAlarmPage = true;
+  lastAlarmPageToggle = millis();
+
   centerText(message);  // Use the corrected centerText function
 }
 
@@ -214,22 +256,58 @@ void setBuzzer(bool on) {
 void setLedColorRed() {
   uint8_t mask = (1 << LED_RED_BIT) | (1 << LED_GREEN_BIT) | (1 << LED_BLUE_BIT);
   uint8_t vals = (1 << LED_RED_BIT);
-  Serial.printf("setting color to red");
+  Serial.printf("setting color to red\n");
   sr_applyBits(mask, vals);
 }
 
 void setLedColorYellow() {
   uint8_t mask = (1 << LED_RED_BIT) | (1 << LED_GREEN_BIT) | (1 << LED_BLUE_BIT);
   uint8_t vals = (1 << LED_RED_BIT) | (1 << LED_GREEN_BIT);
-  Serial.printf("setting color to yellow");
+  Serial.printf("setting color to yellow\n");
   sr_applyBits(mask, vals);
 }
 
 void setLedColorGreen() {
   uint8_t mask = (1 << LED_RED_BIT) | (1 << LED_GREEN_BIT) | (1 << LED_BLUE_BIT);
   uint8_t vals = (1 << LED_GREEN_BIT);
-  Serial.printf("setting color to green");
+  Serial.printf("setting color to green\n");
   sr_applyBits(mask, vals);
+}
+
+// ---------- TM1638 Features ----------
+void setLedStatus(float chamberTemp) {
+  if (chamberTemp > TEMP_CRITICAL) {
+    currentLedState = CRITICAL;
+  } else if (chamberTemp > TEMP_WARN) {
+    currentLedState = WARNING;
+  } else {
+    currentLedState = NORMAL;
+  }
+}
+
+void updateTm1638Leds() {
+  switch (currentLedState) {
+    case NORMAL:
+      module.writeLeds(TM1638_LED_NORMAL);
+      break;
+    case WARNING:
+      module.writeLeds(TM1638_LED_WARNING);
+      break;
+    case CRITICAL:
+      if (millis() - lastBlinkTime > TM1638_BLINK_INTERVAL_MS) {
+        lastBlinkTime = millis();
+        blinkLedState = !blinkLedState;
+        module.writeLeds(blinkLedState ? TM1638_LED_CRITICAL : 0b00000000);
+      }
+      break;
+  }
+}
+
+void handleButtons() {
+  uint8_t buttons = module.getButtons();
+  if (buttons & (1 << BUTTON_SILENCE_ALARM)) {
+    buzzerSilenced = true;
+  }
 }
 
 // ---------- Buzzer patterns ----------
@@ -244,6 +322,11 @@ void startBuzzerPattern(int count, int onTime = 120, int offTime = 120) {
 }
 
 void updateBuzzerPattern() {
+  if (buzzerSilenced) {
+    setBuzzer(false);
+    buzzerActive = false;
+    return;
+  }
   if (!buzzerActive) return;
   
   unsigned long now = millis();
@@ -347,7 +430,8 @@ void checkAlarms(float chamberTemp, float waterTemp, bool soilMoisture) {
         }
       }
     }
-  } else {
+  }
+  else {
     if (waterSensorFailCount > 0 || waterPersistentAlarm) {
       waterSensorFailCount = 0;
       if (waterPersistentAlarm) {
@@ -456,20 +540,124 @@ void handleCoolingShutdown(float chamberTemp) {
   }
 }
 
+// ---------- TM1638 Display Update ----------
+
+// 7-segment patterns for 0-9, A-F. Copied from TM1638 library to add decimal points.
+const uint8_t digits[] = {
+  0b00111111,0b00000110,0b01011011,0b01001111,
+  0b01100110,0b01101101,0b01111101,0b00000111,
+  0b01111111,0b01101111,0b01110111,0b01111100,
+  0b00111001,0b01011110,0b01111001,0b01110001
+};
+// Custom patterns
+const uint8_t pattern_r = 0b01010000;
+const uint8_t pattern_blank = 0x00;
+const uint8_t dp = 0b10000000; // decimal point bit
+
+// Custom patterns for scrolling text
+const uint8_t pattern_P = 0b01110011;
+const uint8_t pattern_I = 0b00110000;
+const uint8_t pattern_N = 0b01010100;
+const uint8_t pattern_E = 0b01111001;
+const uint8_t pattern_C = 0b00111001;
+const uint8_t pattern_H = 0b01110110;
+const uint8_t pattern_A = 0b01110111;
+const uint8_t pattern_M = 0b00010101; // Approximation
+const uint8_t pattern_B = 0b01111100;
+const uint8_t pattern_R = 0b01010000;
+
+
+void runStartupAnimation() {
+  // 1. OLED Animation: Fade "CEDRUS"
+  u8g2.firstPage();
+  do {
+    u8g2.setFont(u8g2_font_logisoso24_tr); // A large, stylish font
+    u8g2.drawStr((u8g2.getDisplayWidth() - u8g2.getStrWidth("CEDRUS")) / 2, u8g2.getDisplayHeight() / 2, "CEDRUS");
+  } while (u8g2.nextPage());
+
+  for (int i = 0; i <= 255; i += 5) { // Fade in
+    u8g2.setContrast(i);
+    delay(20);
+  }
+  for (int i = 255; i >= 0; i -= 5) { // Fade out
+    u8g2.setContrast(i);
+    delay(20);
+  }
+
+  // 2. TM1638 Animation: Scroll "PINE CHAMBER"
+  uint8_t scrollText[] = {pattern_P, pattern_I, pattern_N, pattern_E, pattern_blank, pattern_C, pattern_H, pattern_A, pattern_M, pattern_B, pattern_E, pattern_R, pattern_blank, pattern_blank};
+  int textLen = sizeof(scrollText);
+
+  for (int i = 0; i < textLen + 8; i++) {
+    module.displayClear();
+    for (int k = 0; k < 8; k++) {
+      int charIndex = i - (7 - k);
+      if (charIndex >= 0 && charIndex < textLen) {
+        module.displayDig(k, scrollText[charIndex]);
+      }
+    }
+    delay(150);
+  }
+  module.reset(); // Clear display after animation
+}
+
+void updateTm1638Display(float chamberTemp, float outsideTemp) {
+  // This function is written for the 'dvarrel/TM1638' library.
+  // Digits are numbered 7(left) to 0(right).
+  module.displayClear();
+
+  // Display Chamber Temp on digits 7,6,5,4: " XX.X"
+  if (chamberTemp > -100) {
+    module.displayDig(7, pattern_blank); // Blank for spacing
+    int tempInt = abs((int)chamberTemp);
+    int tempFrac = abs((int)(chamberTemp * 10)) % 10;
+    module.displayDig(6, (tempInt >= 10) ? digits[(tempInt / 10) % 10] : pattern_blank);
+    module.displayDig(5, digits[tempInt % 10] | dp); // Add decimal point
+    module.displayDig(4, digits[tempFrac]);
+  } else {
+    // Display " Err "
+    module.displayDig(7, pattern_blank);
+    module.displayDig(6, digits[14]); // E
+    module.displayDig(5, pattern_r);   // r
+    module.displayDig(4, pattern_r);   // r
+  }
+
+  // Display Outside Temp on digits 3,2,1,0: " YY.Y"
+  if (!isnan(outsideTemp)) {
+    module.displayDig(3, pattern_blank); // Blank for spacing
+    int tempInt = abs((int)outsideTemp);
+    int tempFrac = abs((int)(outsideTemp * 10)) % 10;
+    module.displayDig(2, (tempInt >= 10) ? digits[(tempInt / 10) % 10] : pattern_blank);
+    module.displayDig(1, digits[tempInt % 10] | dp); // Add decimal point
+    module.displayDig(0, digits[tempFrac]);
+  } else {
+    // Display " Err "
+    module.displayDig(3, pattern_blank);
+    module.displayDig(2, digits[14]); // E
+    module.displayDig(1, pattern_r);   // r
+    module.displayDig(0, pattern_r);   // r
+  }
+}
+
+
 // ---------- Setup ----------
 void setup() {
   Serial.begin(115200);
-  dhtInside.begin();
+  Serial.println("Pine Chamber Init");
+
+  // dhtInside.begin(); // REMOVED
   dhtOutside.begin();
   ds.begin();
 
-#if SOIL_MOISTURE_ENABLED
-  pinMode(SOIL_MOISTURE_PIN, INPUT_PULLUP); // Digital soil moisture pin as input with pullup
-#endif
+  // Initialize TM1638
+  module.displayTurnOn();
+  module.displaySetBrightness(PULSE14_16); // Max brightness
+  module.reset(); // Clears both digits and LEDs
 
   // Initialize 74HC595 pins
   pinMode(LATCH_PIN, OUTPUT);
-  pinMode(CLOCK_PIN, OUTPUT);
+  digitalWrite(LATCH_PIN, LOW); // IMPORTANT: Keep D8 (GPIO15) LOW for boot
+  // pinMode(CLOCK_PIN, OUTPUT); // This is handled by the TM1638 constructor, as D7 is a shared pin.
   pinMode(DATA_PIN, OUTPUT);
 
   // Initialize to safe defaults BEFORE any blocking operations
@@ -481,6 +669,9 @@ void setup() {
   u8g2.begin();
   u8g2.enableUTF8Print();
 
+  // Run startup animations
+  runStartupAnimation();
+
   titleX = u8g2.getDisplayWidth();  // start scrolling from right
   logEvent("INFO", "Pine Chamber startup complete. Actuators set to safe defaults.");
 }
@@ -490,67 +681,84 @@ void loop() {
   unsigned long now = millis();
 
   // ----- Sensor readings every READ_INTERVAL_MS -----
-  static float tIn=0, hIn=0, tOut=0, hOut=0, chamberTemp=0, waterTemp=0;
+  static float insideTemp=0, tOut=0, hOut=0, chamberTemp=0, waterTemp=0;
   if (now - lastRead >= READ_INTERVAL_MS) {
     lastRead = now;
 
-    // DHT
-    tIn = dhtInside.readTemperature();
-    hIn = dhtInside.readHumidity();
+    // DHT (Outside only)
     tOut = dhtOutside.readTemperature();
     hOut = dhtOutside.readHumidity();
 
     // DS18B20
     ds.requestTemperatures();
+    insideTemp = ds.getTempC(insideSensor);
     chamberTemp = ds.getTempC(chamberSensor);
     waterTemp = ds.getTempC(waterSensor);
 
 #if SOIL_MOISTURE_ENABLED
     // Soil Moisture
     soilMoistureAnalog = analogRead(SOIL_MOISTURE_ANALOG_PIN);
-    soilMoisture = digitalRead(SOIL_MOISTURE_PIN);
+    soilIsDry = (soilMoistureAnalog > SOIL_ANALOG_DRY_THRESHOLD);
     
     // Serial debug
-    Serial.printf("In: %.1fC %.1f%% | Out: %.1fC %.1f%% | Chamber: %.1fC | Water: %.1fC | Soil Analog: %.0f | Soil Digital: %s\n",
-                  tIn, hIn, tOut, hOut, chamberTemp, waterTemp, soilMoistureAnalog, soilMoisture == SOIL_DIGITAL_DRY_STATE ? "DRY" : "WET");
+    Serial.printf("In: %.1fC | Out: %.1fC %.1f%% | Chamber: %.1fC | Water: %.1fC | Soil Analog: %.0f | Soil is Dry: %s\n",
+                  insideTemp, tOut, hOut, chamberTemp, waterTemp, soilMoistureAnalog, soilIsDry ? "YES" : "NO");
 #else
     // Serial debug (without soil moisture)
-    Serial.printf("In: %.1fC %.1f%% | Out: %.1fC %.1f%% | Chamber: %.1fC | Water: %.1fC\n",
-                  tIn, hIn, tOut, hOut, chamberTemp, waterTemp);
+    Serial.printf("In: %.1fC | Out: %.1fC %.1f%% | Chamber: %.1fC | Water: %.1fC\n",
+                  insideTemp, tOut, hOut, chamberTemp, waterTemp);
 #endif
 
     // Logic
 #if SOIL_MOISTURE_ENABLED
-    checkAlarms(chamberTemp, waterTemp, soilMoisture);
-    updateLEDStatus(chamberTemp, waterTemp, soilMoisture);
+    checkAlarms(chamberTemp, waterTemp, soilIsDry);
+    updateLEDStatus(chamberTemp, waterTemp, soilIsDry);
 #else
-    checkAlarms(chamberTemp, waterTemp, HIGH); // Pass default HIGH value when soil sensor is disabled
-    updateLEDStatus(chamberTemp, waterTemp, HIGH); // Pass default HIGH value when soil sensor is disabled
+    checkAlarms(chamberTemp, waterTemp, false); // Pass default false value when soil sensor is disabled
+    updateLEDStatus(chamberTemp, waterTemp, false); // Pass default false value when soil sensor is disabled
 #endif
+    setLedStatus(chamberTemp); // Set status for TM1638 LEDs
     handleCoolingShutdown(chamberTemp);
+
+    // Update TM1638 display
+    updateTm1638Display(chamberTemp, tOut);
   }
 
-  // Update buzzer pattern (non-blocking)
+  // Handle features that need to run on every loop iteration
+  handleButtons();
+  updateTm1638Leds();
   updateBuzzerPattern();
 
   // ----- Display -----
+  // Handle alarm state and page toggling
   if (alarmActive) {
+    // Check if the total alarm duration has expired
     if (millis() - alarmStartTime >= ALARM_DISPLAY_TIME_MS) {
       alarmActive = false;
+      showAlarmPage = false;
     }
-  } else { // Don't switch pages if an alarm is active
-      if (now - lastPageSwitch >= PAGE_SWITCH_INTERVAL_MS) {
-        lastPageSwitch = now;
-        currentPage = (currentPage + 1) % 2;
-      }
+
+    // Check if it's time to toggle between alarm and data screens
+    if (millis() - lastAlarmPageToggle > ALARM_PAGE_TOGGLE_INTERVAL_MS) {
+      lastAlarmPageToggle = millis();
+      showAlarmPage = !showAlarmPage;
+    }
+  }
+  
+  // Handle normal page switching (only when no alarm is active)
+  if (!alarmActive && (now - lastPageSwitch >= PAGE_SWITCH_INTERVAL_MS)) {
+    lastPageSwitch = now;
+    currentPage = (currentPage + 1) % 2;
   }
 
   u8g2.clearBuffer();
   
-  // Show alarm message when alarm is active
-  if (alarmActive) {
+  // Decide what to draw
+  if (alarmActive && showAlarmPage) {
+    // If an alarm is active and it's time to show it, draw the alarm message
     centerText(currentAlarmMessage);
   } else {
+    // Otherwise, draw the normal data pages (this now also happens during an alarm)
     u8g2.setFont(u8g2_font_ncenB08_tr);
 
     // Scroll animation (independent)
@@ -566,7 +774,7 @@ void loop() {
     if (currentPage == 0) {
     // Inside
     printText("In:", 2);
-    rightText(!isnan(tIn)&&!isnan(hIn)? String(tIn,1)+"C "+String((int)hIn)+"%":"Err", 2);
+    rightText(insideTemp > -100 ? String(insideTemp,1)+"C":"Err", 2);
 
     // Outside
     printText("Out:", 3);
@@ -587,7 +795,7 @@ void loop() {
 
     // Soil Moisture Digital
     printText("Soil D:", 3);
-    rightText(soilMoisture == SOIL_DIGITAL_DRY_STATE ? "DRY" : "WET", 3);
+    rightText(soilIsDry ? "DRY" : "WET", 3);
     
     // Uptime
     unsigned long total_seconds = millis() / 1000;

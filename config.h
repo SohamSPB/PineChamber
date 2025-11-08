@@ -35,6 +35,13 @@ const uint8_t SOIL_DIGITAL_WET_STATE = (SOIL_DIGITAL_DRY_STATE == HIGH) ? LOW : 
 // Soil moisture sensor enable/disable
 #define SOIL_MOISTURE_ENABLED 0  // Set to 1 to enable, 0 to disable soil moisture sensor
 
+// TM1638 Features
+#define BUTTON_SILENCE_ALARM S8                // Which button silences the alarm (S1-S8)
+const int TM1638_BLINK_INTERVAL_MS = 250;    // Blink speed for critical LED status
+const uint8_t TM1638_LED_NORMAL    = 0b00000001; // 1 LED
+const uint8_t TM1638_LED_WARNING   = 0b00000011; // 2 LEDs
+const uint8_t TM1638_LED_CRITICAL  = 0b00000111; // 3 LEDs
+
 #endif // PINE_CHAMBER_CONFIG_H
 
 
